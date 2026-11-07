@@ -50,6 +50,79 @@ def trace(payload, outcome):
         pass
 
 
+def _gate_todolist_all_done(payload):
+    import advisor_core as core
+    import warden_guards as wg
+
+    cfg = core.load_config()
+    done_cfg = cfg.get("done") or {}
+    if not done_cfg.get("enabled", True):
+        return 0
+    session_id = payload.get("session_id")
+    wire = core.find_session_wire(session_id)
+    if not wire:
+        return 0
+    parsed = getattr(core, "parse_wire_current_turn", core.parse_wire)(wire)
+    turn_entries, tk, _, _ = core.current_turn_slice(parsed["entries"])
+    if not tk:
+        return 0
+    if any(e["kind"] == "tool_call" and str(e.get("name") or "").endswith(core.ADVISOR_TOOL_SUFFIX) for e in turn_entries):
+        return 0
+
+    redact_fn = core.redact if cfg.get("redact_secrets", True) else (lambda s: s)
+    evidence = wg.collect_turn_evidence(turn_entries, cwd=payload.get("cwd"), redact_fn=redact_fn)
+    if evidence["mutations"] == 0 and evidence.get("ops_mutations", 0) == 0:
+        return 0
+
+    with core.SessionState(wire) as st:
+        todo_turns = st.data.get("todo_gated_turns") or []
+        if tk in todo_turns:
+            return 0
+
+    if wg.needs_done_check(evidence):
+        with core.SessionState(wire) as st:
+            todo_turns = st.data.get("todo_gated_turns") or []
+            st.data["todo_gated_turns"] = (todo_turns + [tk])[-50:]
+        core.log_event({"session": session_id, "decision": "todo_done_blocked", "mutations": evidence["mutations"]})
+        cmd = wg.project_check_command(payload.get("cwd"))
+        hint = f"Run `{cmd}`" if cmd else "Run the project's tests, build, or syntax check"
+        sys.stderr.write(
+            f"[kimi-advisor done-check] Hold on: you modified {evidence['mutations']} file(s) with no passing check since "
+            f"the last change. {hint} before marking all TodoList items `done`."
+        )
+        return 2
+
+    if not done_cfg.get("completion_gate", False):
+        return 0
+    if evidence["mutations"] < 2 and evidence.get("ops_mutations", 0) == 0:
+        return 0
+    kimi_cfg = core.load_kimi_config()
+    if core.all_same_model(parsed.get("executor_model"), cfg, kimi_cfg):
+        return 0
+    detail = None
+    if cfg["jev"]["enabled"]:
+        try:
+            skip, detail = core.screen(parsed["entries"], cfg)
+        except core.JevError:
+            return 0
+        if skip:
+            core.log_event({"session": session_id, "decision": "skipped_jev", "trigger": "todo_gate", "jev": detail})
+            return 0
+
+    with core.SessionState(wire) as st:
+        todo_turns = st.data.get("todo_gated_turns") or []
+        st.data["todo_gated_turns"] = (todo_turns + [tk])[-50:]
+        if detail:
+            st.data["prescreened_turn"] = tk
+            st.data["prescreened_detail"] = detail
+    core.log_event({"session": session_id, "decision": "todo_advisor_required", "mutations": evidence["mutations"], "jev": detail})
+    sys.stderr.write(
+        "[kimi-advisor completion gate] Before marking all TodoList items `done`, call `ask_advisor({})` now for a "
+        "final review, then mark the TodoList done and write your final summary."
+    )
+    return 2
+
+
 def main(payload):
     tool_name = str(payload.get("tool_name") or "")
     session_id = payload.get("session_id")
@@ -64,6 +137,12 @@ def main(payload):
                 st.data.pop("pending_steer", None)
                 st.data["last_stuck_step"] = -999
         return 0
+
+    if tool_name == "TodoList":
+        todos = (payload.get("tool_input") or {}).get("todos")
+        if not isinstance(todos, list) or not todos or not all(isinstance(t, dict) and t.get("status") == "done" for t in todos):
+            return 0
+        return _gate_todolist_all_done(payload)
 
     if not session_id:
         return 0

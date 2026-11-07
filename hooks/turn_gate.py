@@ -112,23 +112,18 @@ def main(payload):
         if tk in done_turns:
             return allow("turn_already_gated")
 
-    try:
-        verdict = wg.evaluate_done_with_jev(task_text, final_assistant, evidence, cfg, core.jev_judge, redact_fn)
-    except Exception as e:  # noqa: BLE001
-        core.log_event({"session": session_id, "decision": "done_error", "error": str(e)[:300]})
-        return allow("done_jev_error")
-    if not verdict.get("claimed"):
-        return allow("not_claiming_done")
-
-    if verdict.get("unverified"):
-        need, info = (False, "advisor_called") if advisor_called else jev_wants_advisor(
-            core, parsed, cfg, session_id, wire, tk, "done_check")
+    # Path A: unverified code changes (no passing check since last Edit/Write) -> 1 Jev call (doneQuestions), require test only
+    if need_test_check:
+        try:
+            verdict = wg.evaluate_done_with_jev(task_text, final_assistant, evidence, cfg, core.jev_judge, redact_fn)
+        except Exception as e:  # noqa: BLE001
+            core.log_event({"session": session_id, "decision": "done_error", "error": str(e)[:300]})
+            return allow("done_jev_error")
+        if not verdict.get("claimed"):
+            return allow("not_claiming_done")
+        if not verdict.get("unverified"):
+            return allow("claimed_not_checkable")
         nudge = wg.done_nudge(verdict, cwd=cwd)
-        if need:
-            nudge += (
-                f" Jev judged this change needs a second opinion ({jev_note(info)}): after the check passes, "
-                "call `ask_advisor({})` before declaring the task done."
-            )
         _mark_turn_gated(core, wire, tk)
         core.log_event({
             "session": session_id,
@@ -136,16 +131,36 @@ def main(payload):
             "mutations": evidence["mutations"],
             "reasons": verdict.get("reasons"),
             "judgment": verdict.get("judgment"),
-            "advisor_required": need,
-            "jev": info,
+            "advisor_required": False,
         })
         sys.stderr.write(nudge)
         return 2
 
+    # Path B: checks passed (or ops changes), completion_gate on, no ask_advisor yet -> filter minor 1-file edits, then 1 batched Jev call
     if gate_on and not advisor_called:
-        need, info = jev_wants_advisor(core, parsed, cfg, session_id, wire, tk, "stop_gate")
-        if not need:
-            return allow(f"gate_{info}")
+        if evidence["mutations"] < 2 and ops_changes == 0:
+            return allow("minor_single_file")
+        kimi_cfg = core.load_kimi_config()
+        if core.all_same_model(parsed.get("executor_model"), cfg, kimi_cfg):
+            return allow("gate_same_model")
+        if not cfg["jev"]["enabled"]:
+            return allow("gate_jev_disabled")
+        try:
+            gate_res = wg.evaluate_stop_gate_batched(
+                task_text, final_assistant, evidence, parsed["entries"], cfg, core, redact_fn
+            )
+        except Exception as e:  # noqa: BLE001
+            core.log_event({"session": session_id, "decision": "done_screen_error", "trigger": "stop_gate", "error": str(e)[:300]})
+            return allow("gate_jev_error")
+        if not gate_res["claimed"]:
+            return allow("not_claiming_done")
+        info = gate_res["detail"]
+        if gate_res["skip"]:
+            core.log_event({"session": session_id, "decision": "skipped_jev", "trigger": "stop_gate", "jev": info})
+            return allow("gate_jev_skip")
+        with core.SessionState(wire) as st:
+            st.data["prescreened_turn"] = tk
+            st.data["prescreened_detail"] = info
         _mark_turn_gated(core, wire, tk)
         change_desc = (
             f"modifying {evidence['mutations']} project file(s)"
@@ -162,7 +177,8 @@ def main(payload):
         sys.stderr.write(
             f"[kimi-advisor completion gate] You report this task as done after {change_desc}, "
             f"and Jev judged the change needs a second opinion ({jev_note(info)}). "
-            "Call `ask_advisor({})` now for a final review before ending your turn."
+            "Call `ask_advisor({})` now for a final review. If the Advisor returns `Verdict: sound`, "
+            "reply with a brief one-line confirmation rather than repeating your full summary."
         )
         return 2
 

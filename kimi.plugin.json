@@ -21,9 +21,9 @@
   "hooks": [
     {
       "event": "PreToolUse",
-      "matcher": "^(Bash|Edit|Write|.*__ask_advisor)$",
+      "matcher": "^(Bash|Edit|Write|TodoList|.*__ask_advisor)$",
       "command": "python3 ./hooks/bind_call.py",
-      "timeout": 5
+      "timeout": 15
     },
     {
       "event": "PostToolUseFailure",

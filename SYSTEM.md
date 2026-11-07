@@ -5,7 +5,7 @@ You have an `ask_advisor` tool (`mcp__plugin-kimi-advisor_advisor__ask_advisor`)
 ## When to call
 
 - **Before declaring done**: Call `ask_advisor` when you believe a task is complete on any task longer than a few steps, any task tracked with `TodoList`, or any task that modifies files, system configs, containers, processes, or external services.
-  - **Timing**: First make your deliverable durable on disk (write the file, save the result, run verification commands) so the work survives if the session ends during the call — then call `ask_advisor` **before** marking the final `TodoList` item `done`, sending a completion `NotifyUser`, or writing your final reply. Do not rationalize a multi-step change or maintenance operation as "routine" to skip this check.
+  - **Timing**: First make your deliverable durable on disk (write the file, save the result, run verification commands) so the work survives if the session ends during the call — then call `ask_advisor` **before** marking the final `TodoList` item `done`, sending a completion `NotifyUser`, or writing your final reply. If `ask_advisor` is triggered at the end of a turn and returns `Verdict: sound`, reply with a brief one-line confirmation rather than repeating your full summary.
 - **When stuck**: Call `ask_advisor` when errors keep recurring, the approach is not converging, results don't fit, or you are considering a change of approach.
 - **When NOT to call**: On intermediate reactive steps where the tool output you just read dictates the next action, you do not need to keep calling. Skip `ask_advisor` altogether only for single-step answers, pure read-only lookups (e.g. checking a version or status), or demonstrably trivial low-risk edits (e.g. a typo).
 

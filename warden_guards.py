@@ -392,7 +392,8 @@ def is_ops_mutation(tool_name, input_args, is_error, output):
     tool = (tool_name or "").lower()
     args = input_args if isinstance(input_args, dict) else {}
     if tool == "todolist":
-        return bool(args.get("todos"))
+        todos = args.get("todos")
+        return bool(isinstance(todos, list) and todos and all(isinstance(t, dict) and t.get("status") == "done" for t in todos))
     if tool != "bash":
         return False
     raw_cmd = args.get("command") if isinstance(args.get("command"), str) else ""
@@ -530,6 +531,44 @@ def evaluate_done_with_jev(task, final_message, evidence, cfg, jev_judge_fn, red
             "claims_verified": claims_verified,
             "verification_applies": verification_applies,
             "outcome": outcome,
+            "latency_ms": res.get("latencyMs"),
+        },
+    }
+
+
+def evaluate_stop_gate_batched(task, final_message, evidence, entries, cfg, core, redact_fn):
+    """Single batched Jev call for Stop completion_gate: evaluates claims_done + stakes/self_answerable in one pass."""
+    digest = core.render_transcript(entries, cfg["jev"]["digest_max_chars"], caps=core.DIGEST_CAPS, keep_first_user=False)
+    state = {
+        "role": "executor",
+        "task": (task.strip()[:1500] + ("…" if len(task.strip()) > 1500 else "")) if task and task.strip() else "(no user request recorded)",
+        "final_message": redact_fn(final_message[:2000] + ("…" if len(final_message) > 2000 else "")),
+        "run": {
+            "file_changes": evidence["mutations"],
+            "ops_changes": evidence.get("ops_mutations", 0),
+            "checks_run": [f"{c['call']} -> {'passed' if c['passed'] else 'failed'}" for c in fresh_checks(evidence)],
+        },
+        "recent_conversation": redact_fn(digest) if digest else "",
+    }
+    questions = [DON for DON in DONE_QUESTIONS if DON["id"] in ("claims_done", "outcome")] + list(core.SCREENING_QUESTIONS)
+    verdicts, res = core.jev_judge(state, questions, cfg)
+    claims_done = (verdicts.get("claims_done") or {}).get("answer")
+    outcome = (verdicts.get("outcome") or {}).get("answer")
+    negligible = ((verdicts.get("stakes") or {}).get("distribution") or {}).get("0")
+    p_self = (verdicts.get("self_answerable") or {}).get("answer")
+    if not isinstance(claims_done, (int, float)) or not isinstance(negligible, (int, float)) or not isinstance(p_self, (int, float)):
+        raise core.JevError(f"malformed batched Jev verdicts: {json.dumps(verdicts)[:300]}")
+    threshold = (cfg.get("done") or {}).get("claims_done", 0.7)
+    claimed = claims_done >= threshold and outcome != "blocked"
+    jc = cfg["jev"]
+    skip = negligible >= jc["skip_confidence"] and p_self >= 0.5 + jc["noul_margin"]
+    return {
+        "claimed": claimed,
+        "skip": skip,
+        "detail": {
+            "negligible": negligible,
+            "self_answerable": p_self,
+            "claims_done": claims_done,
             "latency_ms": res.get("latencyMs"),
         },
     }
