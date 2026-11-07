@@ -15,6 +15,7 @@ Keys for `set`:
   jev-preset <preset>        strict | pi | loose (pi = pi-advisor-flow default: 0.85/0.35)
   stuck on|off               enable/disable pi-warden stuck guard (AttemptWindow + same_strategy >= 0.7)
   done on|off                enable/disable pi-warden done-check guard (mutations vs freshChecks + doneQuestions)
+  rules on|off               enable/disable pi-warden AGENTS.md per-section rules guard (P(violation) >= 0.7)
   completion-gate on|off     on a done claim after file changes + passing checks, require ask_advisor if Jev says so (default off)
   same-model-skip on|off     skip consultation when executor and advisor are the same model
   context <chars>|full       max chars of conversation sent per call; full = fit to advisor window
@@ -38,6 +39,7 @@ KEY_MAP = {
     "jev-preset": "jev_preset",
     "stuck": "stuck_enabled",
     "done": "done_enabled",
+    "rules": "rules_enabled",
     "completion-gate": "completion_gate",
     "same-model-skip": "disable_same_model",
     "context": "context_max_chars",
@@ -57,6 +59,7 @@ def show():
     print(f"jev screening    {'on' if v['jev_enabled'] else 'off'} · preset {jev_note}")
     print(f"stuck guard      {'on' if v['stuck_enabled'] else 'off'} (pi-warden AttemptWindow=12, min_failures=3, cooldown=3, same_strategy>=0.7)")
     print(f"done-check       {'on' if v['done_enabled'] else 'off'} (pi-warden freshChecks + claims_done>=0.7)")
+    print(f"rules guard      {'on' if v.get('rules_enabled', True) else 'off'} (pi-warden AGENTS.md per-section rules, P(violation)>=0.7)")
     print(f"completion gate  {'on' if v['completion_gate'] else 'off'} (done claim after file changes -> ask_advisor if Jev says so)")
     print(f"same-model skip  {'on' if v['disable_same_model'] else 'off'}")
     print(f"context cap      {v['context_max_chars']}")
@@ -67,7 +70,7 @@ def show():
     s = core.stats()
     print(f"stats            consulted {s['consulted']}, skipped jev {s['skipped_jev']}, same-model {s['skipped_same_model']}, "
           f"budget {s['skipped_budget']}, stuck-steered {s['stuck_steered']} (+{s['stuck_quick_repeat']} quick-repeat), "
-          f"done-blocked {s['done_blocked']}, errors {s['error']}, avg {s['avg_latency_s']}s / {s['avg_input_tokens']} in-tok")
+          f"done-blocked {s['done_blocked']}, rules-blocked {s.get('rules_blocked', 0)}, errors {s['error']}, avg {s['avg_latency_s']}s / {s['avg_input_tokens']} in-tok")
     runs = ", ".join(f"{k} {n}" for k, n in sorted(s["hook_runs"].items())) or "none recorded"
     print(f"hook runs        {runs}" + (f" (last {s['hook_last_run']})" if s["hook_last_run"] else ""))
 

@@ -73,7 +73,9 @@ def main(payload):
 
     cfg = core.load_config()
     done_cfg = cfg.get("done") or {}
-    if not done_cfg.get("enabled", True):
+    done_on = done_cfg.get("enabled", True)
+    rules_on = (cfg.get("rules") or {}).get("enabled", True)
+    if not done_on and not rules_on:
         return allow("done_disabled")
     session_id = payload.get("session_id")
     cwd = payload.get("cwd")
@@ -97,20 +99,41 @@ def main(payload):
         e["kind"] == "tool_call" and str(e.get("name") or "").endswith(core.ADVISOR_TOOL_SUFFIX)
         for e in turn_entries
     )
-    need_test_check = wg.needs_done_check(evidence)
-    gate_on = done_cfg.get("completion_gate", False)
+    need_test_check = done_on and wg.needs_done_check(evidence)
+    gate_on = done_on and done_cfg.get("completion_gate", False)
     ops_changes = evidence.get("ops_mutations", 0) if gate_on else 0
-    if evidence["mutations"] == 0 and ops_changes == 0:
+    suspect_fact = rules_on and wg.needs_unverified_fact_check(evidence, final_assistant)
+
+    if evidence["mutations"] == 0 and ops_changes == 0 and not suspect_fact:
         return allow("no_mutations")
-    if not need_test_check and advisor_called:
-        return allow("checked_and_advisor_called")
-    if not need_test_check and not gate_on:
-        return allow("checks_passed")
 
     with core.SessionState(wire) as st:
         done_turns = st.data.get("done_checked_turns") or []
         if tk in done_turns:
             return allow("turn_already_gated")
+
+    # Zero-mutation turn with suspect unverified external fact claims -> 1 Jev call on fact/verification rules
+    if evidence["mutations"] == 0 and ops_changes == 0 and suspect_fact:
+        if not cfg["jev"]["enabled"]:
+            return allow("no_mutations")
+        try:
+            violated = wg.evaluate_turn_rules_with_jev(
+                task_text, final_assistant, evidence, cwd, cfg, core, redact_fn, fact_only=True
+            )
+        except Exception as e:  # noqa: BLE001
+            core.log_event({"session": session_id, "decision": "rules_error", "error": str(e)[:300]})
+            return allow("rules_jev_error")
+        if not violated:
+            return allow("no_mutations")
+        _mark_turn_gated(core, wire, tk)
+        core.log_event({"session": session_id, "decision": "rules_blocked", "violated": [r["name"] for r in violated]})
+        sys.stderr.write(wg.rules_nudge(violated))
+        return 2
+
+    if not need_test_check and advisor_called:
+        return allow("checked_and_advisor_called")
+    if not need_test_check and not gate_on and not rules_on:
+        return allow("checks_passed")
 
     # Path A: unverified code changes (no passing check since last Edit/Write) -> 1 Jev call (doneQuestions), require test only
     if need_test_check:
@@ -136,10 +159,12 @@ def main(payload):
         sys.stderr.write(nudge)
         return 2
 
-    # Path B: checks passed (or ops changes), completion_gate on, no ask_advisor yet -> filter minor 1-file edits, then 1 batched Jev call
-    if gate_on and not advisor_called:
-        if evidence["mutations"] < 2 and ops_changes == 0:
-            return allow("minor_single_file")
+    # Fast-exit for tiny 1-file typo edits with no suspect diff patterns
+    if evidence["mutations"] < 2 and ops_changes == 0 and not wg.is_nontrivial_single_mutation(evidence, task_text):
+        return allow("minor_single_file" if gate_on else "checks_passed")
+
+    # Path B: completion_gate on (and >=2 mutations or ops_changes), no ask_advisor yet -> 1 batched Jev call (done + screen + AGENTS.md rules)
+    if gate_on and not advisor_called and (evidence["mutations"] >= 2 or ops_changes > 0):
         kimi_cfg = core.load_kimi_config()
         if core.all_same_model(parsed.get("executor_model"), cfg, kimi_cfg):
             return allow("gate_same_model")
@@ -147,11 +172,17 @@ def main(payload):
             return allow("gate_jev_disabled")
         try:
             gate_res = wg.evaluate_stop_gate_batched(
-                task_text, final_assistant, evidence, parsed["entries"], cfg, core, redact_fn
+                task_text, final_assistant, evidence, parsed["entries"], cfg, core, redact_fn, cwd=cwd
             )
         except Exception as e:  # noqa: BLE001
             core.log_event({"session": session_id, "decision": "done_screen_error", "trigger": "stop_gate", "error": str(e)[:300]})
             return allow("gate_jev_error")
+        if gate_res.get("violated_rules"):
+            violated = gate_res["violated_rules"]
+            _mark_turn_gated(core, wire, tk)
+            core.log_event({"session": session_id, "decision": "rules_blocked", "violated": [r["name"] for r in violated]})
+            sys.stderr.write(wg.rules_nudge(violated))
+            return 2
         if not gate_res["claimed"]:
             return allow("not_claiming_done")
         info = gate_res["detail"]
@@ -182,7 +213,22 @@ def main(payload):
         )
         return 2
 
-    return allow("claimed_not_checkable")
+    # Path C: checks passed, completion_gate off (or nontrivial single-file edit) -> 1 Jev call for AGENTS.md rules
+    if rules_on and cfg["jev"]["enabled"] and wg.is_nontrivial_single_mutation(evidence, task_text):
+        try:
+            violated = wg.evaluate_turn_rules_with_jev(
+                task_text, final_assistant, evidence, cwd, cfg, core, redact_fn, fact_only=False
+            )
+        except Exception as e:  # noqa: BLE001
+            core.log_event({"session": session_id, "decision": "rules_error", "error": str(e)[:300]})
+            return allow("checks_passed")
+        if violated:
+            _mark_turn_gated(core, wire, tk)
+            core.log_event({"session": session_id, "decision": "rules_blocked", "violated": [r["name"] for r in violated]})
+            sys.stderr.write(wg.rules_nudge(violated))
+            return 2
+
+    return allow("checks_passed")
 
 
 if __name__ == "__main__":

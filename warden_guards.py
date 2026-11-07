@@ -405,11 +405,26 @@ def is_ops_mutation(tool_name, input_args, is_error, output):
 def collect_turn_evidence(turn_entries, cwd=None, redact_fn=None):
     """Build pi-warden done.js Evidence across the turn's tool_call/tool_result pairs."""
     redact_fn = redact_fn or (lambda s: s)
-    evidence = {"mutations": 0, "ops_mutations": 0, "checks": [], "checks_before_mutation": 0}
+    evidence = {
+        "mutations": 0,
+        "ops_mutations": 0,
+        "checks": [],
+        "checks_before_mutation": 0,
+        "diffs": [],
+        "turn_diff": "",
+        "tools_used": [],
+        "verified_external": False,
+    }
     pending = {}
     for e in turn_entries:
         if e["kind"] == "tool_call":
             pending[e.get("id")] = e
+            tname = str(e.get("name") or "")
+            if tname:
+                evidence["tools_used"].append(tname)
+                low = tname.lower()
+                if any(k in low for k in ("search", "fetch", "read", "grep", "glob", "bash", "data_source")):
+                    evidence["verified_external"] = True
         elif e["kind"] == "tool_result":
             call = pending.pop(e.get("id"), None)
             if not call:
@@ -422,12 +437,19 @@ def collect_turn_evidence(turn_entries, cwd=None, redact_fn=None):
             if outcome == "mutation":
                 evidence["mutations"] += 1
                 evidence["checks_before_mutation"] = len(evidence["checks"])
+                d = _edit_diff((call["name"] or "").lower(), args)
+                evidence["diffs"].append(
+                    f"--- {redact_fn(d['path'])} (+{d['added']}/-{d['removed']}) ---\n{redact_fn(d['diff'])}"
+                )
             elif outcome in ("check-pass", "check-fail"):
                 cmd = args.get("command") if isinstance(args, dict) else ""
                 label = redact_fn(cmd[:200] + ("…" if len(cmd) > 200 else "")) if cmd else "check"
                 evidence["checks"].append({"call": label, "passed": outcome == "check-pass"})
             if is_ops_mutation(call["name"], args, e.get("error"), e.get("text") or ""):
                 evidence["ops_mutations"] += 1
+    if evidence["diffs"]:
+        joined = "\n".join(evidence["diffs"])
+        evidence["turn_diff"] = joined[:4000] + ("… [turn diff capped]" if len(joined) > 4000 else "")
     return evidence
 
 
@@ -536,9 +558,141 @@ def evaluate_done_with_jev(task, final_message, evidence, cfg, jev_judge_fn, red
     }
 
 
-def evaluate_stop_gate_batched(task, final_message, evidence, entries, cfg, core, redact_fn):
-    """Single batched Jev call for Stop completion_gate: evaluates claims_done + stakes/self_answerable in one pass."""
-    digest = core.render_transcript(entries, cfg["jev"]["digest_max_chars"], caps=core.DIGEST_CAPS, keep_first_user=False)
+RULE_OUTCOMES = {
+    "compliant": "The work follows this rule, or no direct evidence shows a break.",
+    "violation": "There is direct, concrete evidence in `diff`, `run`, or `final_message` that this turn's work broke this rule.",
+    "not_applicable": "This rule does not apply to this turn's task or changes.",
+    "insufficient_context": "The information shown is not enough to judge this rule with confidence.",
+}
+
+RULE_IMP_RE = re.compile(
+    r"^\s*[-*+]\s|^\s*\d+\.\s|必须|不得|不要|禁止|严禁|优先|切勿|\bmust\b|\bnever\b|\balways\b|\bdo not\b|\bavoid\b|\bprefer\b",
+    re.I | re.M,
+)
+
+EXTERNAL_CLAIM_RE = re.compile(
+    r"\bv?\d+\.\d+\.\d+(?:-[a-zA-Z0-9._-]+)?\b|https?://[^\s)\"'>]+|\b202[5-9]-[01]\d-[0-3]\d\b",
+    re.I,
+)
+
+SUSPECT_DIFF_RE = re.compile(
+    r"127\.0\.0\.1|localhost|192\.168\.|10\.\d+\.\d+\.|sk-[A-Za-z0-9_\-]{12,}|apikey|password|passwd|PRIVATE KEY|fallback|降级",
+    re.I,
+)
+
+
+def parse_agents_md_rules(cwd, core, redact_fn=None):
+    """Split active AGENTS.md files by `## ` headings (or `# ` if none) into individual rule dicts."""
+    redact_fn = redact_fn or (lambda s: s)
+    sources = core.load_agents_md_sources(cwd)
+    rules = []
+    for label, text in sources:
+        lines = text.splitlines()
+        has_h2 = any(ln.startswith("## ") for ln in lines)
+        prefix = "## " if has_h2 else "# "
+        in_fence = False
+        cur_name = None
+        cur_lines = []
+        sections = []
+        for ln in lines:
+            stripped = ln.strip()
+            if stripped.startswith("```") or stripped.startswith("~~~"):
+                in_fence = not in_fence
+                if cur_name is not None:
+                    cur_lines.append(ln)
+                continue
+            if not in_fence and ln.startswith(prefix):
+                if cur_name is not None:
+                    sections.append((cur_name, "\n".join(cur_lines).strip()))
+                cur_name = ln[len(prefix):].strip().rstrip("#").strip()
+                cur_lines = []
+            elif cur_name is not None:
+                cur_lines.append(ln)
+        if cur_name is not None:
+            sections.append((cur_name, "\n".join(cur_lines).strip()))
+        for name, body in sections:
+            if not body or not RULE_IMP_RE.search(body):
+                continue
+            if name in ("工具调用", "MCP 与会话"):
+                continue
+            rules.append({
+                "id": f"rule_{len(rules) + 1}",
+                "name": name,
+                "source": label,
+                "body": redact_fn(body[:400]),
+            })
+            if len(rules) >= 16:
+                return rules
+    return rules
+
+
+def build_rule_questions(rules):
+    questions = []
+    for r in rules:
+        questions.append({
+            "id": r["id"],
+            "type": "choice",
+            "question": (
+                "Does this turn's work (`diff`, `run`, and `final_message`) introduce a clear, concrete violation of "
+                "this rule from `AGENTS.md` relative to the user's `task`? Changes requested by `task`, routine "
+                "verification commands, and temporary test files in /tmp or temp/ are compliant. Choose `violation` "
+                "ONLY when direct evidence in `diff`, `run`, or `final_message` shows this specific rule was broken.\n"
+                f"Rule ({r['source']} · {r['name']}):\n{r['body']}"
+            ),
+            "options": RULE_OUTCOMES,
+        })
+    return questions
+
+
+def extract_violated_rules(rules, verdicts, threshold=0.7):
+    violated = []
+    for r in rules:
+        v = verdicts.get(r["id"]) or {}
+        dist = v.get("distribution") or {}
+        p_viol = dist.get("violation")
+        if not isinstance(p_viol, (int, float)):
+            p_viol = 1.0 if v.get("answer") == "violation" else 0.0
+        if v.get("answer") == "violation" and p_viol >= threshold:
+            violated.append({**r, "score": round(float(p_viol), 2)})
+    return violated
+
+
+def rules_nudge(violated_rules):
+    parts = [f"【{r['source']} · {r['name']}】({r['score']:.2f}): {r['body'].splitlines()[0][:160]}" for r in violated_rules[:3]]
+    return (
+        f"[kimi-advisor rules guard] This turn violates AGENTS.md rule(s): {'; '.join(parts)}. "
+        "Fix the violation directly (e.g., revert out-of-scope/unconfirmed edits, remove credentials/internal addresses, "
+        "or verify external claims with search/FetchURL or explicitly mark them `未验证`) before finishing."
+    )
+
+
+def needs_unverified_fact_check(evidence, final_assistant):
+    if evidence["mutations"] > 0 or evidence.get("ops_mutations", 0) > 0:
+        return False
+    if evidence.get("verified_external"):
+        return False
+    text = (final_assistant or "").strip()
+    if len(text) < 40 or "未验证" in text or "unverified" in text.lower():
+        return False
+    return bool(EXTERNAL_CLAIM_RE.search(text))
+
+
+def is_nontrivial_single_mutation(evidence, task_text=""):
+    if evidence["mutations"] != 1:
+        return evidence["mutations"] > 1
+    diff = evidence.get("turn_diff") or ""
+    if SUSPECT_DIFF_RE.search(diff):
+        return True
+    return len(diff) >= 120
+
+
+def evaluate_turn_rules_with_jev(task, final_message, evidence, cwd, cfg, core, redact_fn, fact_only=False):
+    """Evaluate AGENTS.md per-section rules via 1 Jev call."""
+    rules = parse_agents_md_rules(cwd, core, redact_fn)
+    if fact_only:
+        rules = [r for r in rules if any(k in r["name"] for k in ("验证", "搜索", "网络", "fact", "verify"))]
+    if not rules:
+        return []
     state = {
         "role": "executor",
         "task": (task.strip()[:1500] + ("…" if len(task.strip()) > 1500 else "")) if task and task.strip() else "(no user request recorded)",
@@ -546,11 +700,39 @@ def evaluate_stop_gate_batched(task, final_message, evidence, entries, cfg, core
         "run": {
             "file_changes": evidence["mutations"],
             "ops_changes": evidence.get("ops_mutations", 0),
+            "tools_used": evidence.get("tools_used", [])[:20],
             "checks_run": [f"{c['call']} -> {'passed' if c['passed'] else 'failed'}" for c in fresh_checks(evidence)],
         },
+        "diff": evidence.get("turn_diff") or "(no file changes)",
+    }
+    verdicts, _ = core.jev_judge(state, build_rule_questions(rules), cfg)
+    threshold = ((cfg.get("rules") or {}).get("threshold")) or 0.7
+    return extract_violated_rules(rules, verdicts, threshold=threshold)
+
+
+def evaluate_stop_gate_batched(task, final_message, evidence, entries, cfg, core, redact_fn, cwd=None):
+    """Single batched Jev call for Stop completion_gate + AGENTS.md rules: evaluates claims_done + stakes/self_answerable + rules in one pass."""
+    digest = core.render_transcript(entries, cfg["jev"]["digest_max_chars"], caps=core.DIGEST_CAPS, keep_first_user=False)
+    rules_on = (cfg.get("rules") or {}).get("enabled", True)
+    rules = parse_agents_md_rules(cwd, core, redact_fn) if rules_on else []
+    state = {
+        "role": "executor",
+        "task": (task.strip()[:1500] + ("…" if len(task.strip()) > 1500 else "")) if task and task.strip() else "(no user request recorded)",
+        "final_message": redact_fn(final_message[:2000] + ("…" if len(final_message) > 2000 else "")),
+        "run": {
+            "file_changes": evidence["mutations"],
+            "ops_changes": evidence.get("ops_mutations", 0),
+            "tools_used": evidence.get("tools_used", [])[:20],
+            "checks_run": [f"{c['call']} -> {'passed' if c['passed'] else 'failed'}" for c in fresh_checks(evidence)],
+        },
+        "diff": evidence.get("turn_diff") or "(no file changes)",
         "recent_conversation": redact_fn(digest) if digest else "",
     }
-    questions = [DON for DON in DONE_QUESTIONS if DON["id"] in ("claims_done", "outcome")] + list(core.SCREENING_QUESTIONS)
+    questions = (
+        [DON for DON in DONE_QUESTIONS if DON["id"] in ("claims_done", "outcome")]
+        + list(core.SCREENING_QUESTIONS)
+        + build_rule_questions(rules)
+    )
     verdicts, res = core.jev_judge(state, questions, cfg)
     claims_done = (verdicts.get("claims_done") or {}).get("answer")
     outcome = (verdicts.get("outcome") or {}).get("answer")
@@ -562,9 +744,12 @@ def evaluate_stop_gate_batched(task, final_message, evidence, entries, cfg, core
     claimed = claims_done >= threshold and outcome != "blocked"
     jc = cfg["jev"]
     skip = negligible >= jc["skip_confidence"] and p_self >= 0.5 + jc["noul_margin"]
+    rule_threshold = ((cfg.get("rules") or {}).get("threshold")) or 0.7
+    violated_rules = extract_violated_rules(rules, verdicts, threshold=rule_threshold) if rules else []
     return {
         "claimed": claimed,
         "skip": skip,
+        "violated_rules": violated_rules,
         "detail": {
             "negligible": negligible,
             "self_answerable": p_self,

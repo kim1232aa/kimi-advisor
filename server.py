@@ -70,6 +70,7 @@ TOOLS = [
                 "jev_preset": {"type": "string", "enum": ["strict", "pi", "loose"], "description": "strict = skips fewest calls, pi = pi-advisor-flow default, loose = skips most"},
                 "stuck_enabled": {"type": "boolean", "description": "pi-warden stuck guard (AttemptWindow + Jev same_strategy >= 0.7)"},
                 "done_enabled": {"type": "boolean", "description": "pi-warden done-check guard (mutations vs freshChecks + Jev doneQuestions)"},
+                "rules_enabled": {"type": "boolean", "description": "pi-warden AGENTS.md per-section rules guard at turn end (Jev P(violation) >= 0.7)"},
                 "completion_gate": {"type": "boolean", "description": "At Stop, when the reply claims done after file changes and checks passed, ask Jev whether an advisor review is needed and require ask_advisor only if so (default false)"},
                 "disable_same_model": {"type": "boolean", "description": "Skip when executor and advisor are the same model"},
                 "context_max_chars": {"type": "integer", "minimum": 0, "description": "Max chars of conversation sent per call; 0 = full (fit to the advisor's window)"},
@@ -99,7 +100,7 @@ def tool_ask_advisor(args):
     rec = core.claim_pending(args)
     if rec:
         wire = core.locate_wire(rec["session_id"], rec["tool_call_id"])
-        return core.consult(args, wire_path=wire, call_id=rec["tool_call_id"], binding="hook")
+        return core.consult(args, wire_path=wire, call_id=rec["tool_call_id"], binding="hook", cwd=rec.get("cwd"))
     wire, call_id = core.scan_pending_call(args)
     return core.consult(args, wire_path=wire, call_id=call_id, binding="scan" if wire else "none")
 
