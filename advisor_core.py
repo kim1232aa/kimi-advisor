@@ -36,6 +36,7 @@ PENDING_TTL_S = 120
 
 DEFAULTS = {
     "model": "9router/cc/claude-opus-5-5",
+    "secondary_model": None,
     "effort": None,
     "max_output_tokens": 4096,
     "timeout_s": 300,
@@ -273,7 +274,8 @@ def build_settings_patch(changes):
                 provider, _ = resolve_model(alias)
                 if provider.get("type") not in CALLERS:
                     raise AdvisorError(f'model "{alias}": provider type "{provider.get("type")}" is not supported')
-            patch["model"] = ",".join(deduped)
+            patch["model"] = deduped[0]
+            patch["secondary_model"] = ",".join(deduped[1:]) if len(deduped) > 1 else None
         elif key == "effort":
             v = str(value).strip().lower()
             if v not in ("off", "default", "none") and v not in EFFORTS:
@@ -318,7 +320,7 @@ def settings_view(cfg=None):
     cfg = cfg or load_config()
     jev = cfg["jev"]
     return {
-        "model": cfg["model"],
+        "model": ",".join(configured_models(cfg)),
         "effort": cfg["effort"] or "off",
         "jev_enabled": jev["enabled"],
         "jev_preset": jev_preset_name(jev),
@@ -365,9 +367,12 @@ def model_identity(alias, kimi_cfg):
 
 
 def configured_models(cfg):
-    """Return deduplicated list of configured advisor model aliases (supports comma-separated string or list)."""
+    """Return deduplicated list of configured advisor model aliases (supports comma-separated string, list, or secondary_model)."""
     raw = (cfg or {}).get("model") or DEFAULTS["model"]
-    items = raw if isinstance(raw, list) else str(raw).split(",")
+    items = list(raw) if isinstance(raw, list) else str(raw).split(",")
+    sec = (cfg or {}).get("secondary_model")
+    if sec:
+        items.extend(sec if isinstance(sec, list) else str(sec).split(","))
     out = []
     for item in items:
         a = str(item).strip()

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """kimi-advisor MCP server (stdio, JSON-RPC 2.0, stdlib only)."""
 
+import importlib
 import json
 import os
 import sys
@@ -9,6 +10,23 @@ import traceback
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import advisor_core as core  # noqa: E402
+
+_CORE_PATH = os.path.abspath(core.__file__)
+_core_mtime = os.path.getmtime(_CORE_PATH) if os.path.exists(_CORE_PATH) else 0
+_reload_lock = threading.Lock()
+
+
+def _ensure_fresh_core():
+    global _core_mtime
+    try:
+        m = os.path.getmtime(_CORE_PATH)
+        if m != _core_mtime:
+            with _reload_lock:
+                if m != _core_mtime:
+                    importlib.reload(core)
+                    _core_mtime = m
+    except OSError:
+        pass
 
 SERVER_INFO = {"name": "kimi-advisor", "version": "0.2.0"}
 SUPPORTED_PROTOCOLS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"]
@@ -110,6 +128,7 @@ HANDLERS = {"ask_advisor": tool_ask_advisor, "advisor_config": tool_advisor_conf
 
 
 def handle_call(msg_id, params):
+    _ensure_fresh_core()
     name = params.get("name")
     args = params.get("arguments") or {}
     try:
