@@ -1,0 +1,44 @@
+{
+  "name": "kimi-advisor",
+  "version": "0.3.0",
+  "description": "Advisor second opinion + pi-warden stuck & done-check guards for Kimi Code: full-context advisor (rpiv-advisor), Jev pre-screening (pi-advisor-flow), and Jev-judged AttemptWindow stuck + freshChecks done-check guards (pi-warden).",
+  "keywords": ["advisor", "jev", "pi-warden", "second-opinion", "review", "mcp"],
+  "license": "MIT",
+  "skills": "./skills/",
+  "commands": "./commands/",
+  "systemPromptPath": "./SYSTEM.md",
+  "sessionStart": {
+    "skill": "advisor"
+  },
+  "mcpServers": {
+    "advisor": {
+      "command": "python3",
+      "args": ["./server.py"],
+      "cwd": "./",
+      "toolTimeoutMs": 600000
+    }
+  },
+  "hooks": [
+    {
+      "event": "PreToolUse",
+      "matcher": "^(Bash|Edit|Write|.*__ask_advisor)$",
+      "command": "python3 ./hooks/bind_call.py",
+      "timeout": 5
+    },
+    {
+      "event": "PostToolUseFailure",
+      "command": "python3 ./hooks/on_tool_failure.py",
+      "timeout": 20
+    },
+    {
+      "event": "Stop",
+      "command": "python3 ./hooks/turn_gate.py",
+      "timeout": 25
+    }
+  ],
+  "interface": {
+    "displayName": "Kimi Advisor",
+    "shortDescription": "Escalate to a stronger model + pi-warden stuck & done-check guards (Jev-judged)",
+    "developerName": "local"
+  }
+}
