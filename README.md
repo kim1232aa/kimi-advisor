@@ -174,7 +174,7 @@ python3 ~/.kimi-code/plugins/managed/kimi-advisor/advisor_cli.py set completion-
 
 | MCP 参数名 | CLI `set` 键名 | 默认值 | 说明 |
 | :--- | :--- | :--- | :--- |
-| `model` | `model` | `9router/cc/claude-opus-5-5` | Advisor 模型别名（必须在 `~/.kimi-code/config.toml` 的 `[models]` 中存在） |
+| `model` | `model` | `9router/cc/claude-opus-5-5` | Advisor 模型别名（支持单个别名或逗号分隔多个并行模型，如 `9router/gpt-6.1-sol,9router/gcli/grok-4.7`） |
 | `effort` | `effort` | `off` | Advisor 推理思考档位：`off` / `low` / `medium` / `high` / `xhigh` / `max` |
 | `jev_enabled` | `jev` | `on` | 是否开启 Jev 300ms 前置预筛 |
 | `jev_preset` | `jev-preset` | `pi` | Jev 预筛松紧度：`strict`（0.95/0.45，最少跳过）、`pi`（0.85/0.35，原版默认）、`loose`（0.70/0.20，最省成本） |

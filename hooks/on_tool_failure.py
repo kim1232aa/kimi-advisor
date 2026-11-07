@@ -93,11 +93,7 @@ def main(payload):
 
     kimi_cfg = core.load_kimi_config()
     executor = parsed.get("executor_model")
-    same_model = (
-        cfg.get("disable_same_model", True)
-        and executor
-        and core.model_identity(executor, kimi_cfg) == core.model_identity(cfg["model"], kimi_cfg)
-    )
+    same_model = core.all_same_model(executor, cfg, kimi_cfg)
     msg = wg.stuck_nudge(verdict, can_consult_advisor=not same_model)
     with core.SessionState(wire) as st:
         st.data["pending_steer"] = {"turn": tk, "kind": "stuck", "message": msg}

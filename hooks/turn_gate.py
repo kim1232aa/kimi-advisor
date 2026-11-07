@@ -34,11 +34,7 @@ def jev_wants_advisor(core, parsed, cfg, session_id, wire, tk, trigger):
     """Returns (True, jev_detail) when Jev judges an advisor review is needed, else (False, reason)."""
     kimi_cfg = core.load_kimi_config()
     executor = parsed.get("executor_model")
-    if (
-        cfg.get("disable_same_model", True)
-        and executor
-        and core.model_identity(executor, kimi_cfg) == core.model_identity(cfg["model"], kimi_cfg)
-    ):
+    if core.all_same_model(executor, cfg, kimi_cfg):
         return False, "same_model"
     if not cfg["jev"]["enabled"]:
         return False, "jev_disabled"
@@ -54,6 +50,13 @@ def jev_wants_advisor(core, parsed, cfg, session_id, wire, tk, trigger):
         st.data["prescreened_turn"] = tk
         st.data["prescreened_detail"] = detail
     return True, detail
+
+
+def _mark_turn_gated(core, wire, tk):
+    with core.SessionState(wire) as st:
+        done_turns = st.data.get("done_checked_turns") or []
+        if tk not in done_turns:
+            st.data["done_checked_turns"] = (done_turns + [tk])[-50:]
 
 
 def jev_note(detail):
@@ -90,15 +93,15 @@ def main(payload):
 
     redact_fn = core.redact if cfg.get("redact_secrets", True) else (lambda s: s)
     evidence = wg.collect_turn_evidence(turn_entries, cwd=cwd, redact_fn=redact_fn)
-    if evidence["mutations"] == 0:
-        return allow("no_mutations")
-
     advisor_called = any(
         e["kind"] == "tool_call" and str(e.get("name") or "").endswith(core.ADVISOR_TOOL_SUFFIX)
         for e in turn_entries
     )
     need_test_check = wg.needs_done_check(evidence)
     gate_on = done_cfg.get("completion_gate", False)
+    ops_changes = evidence.get("ops_mutations", 0) if gate_on else 0
+    if evidence["mutations"] == 0 and ops_changes == 0:
+        return allow("no_mutations")
     if not need_test_check and advisor_called:
         return allow("checked_and_advisor_called")
     if not need_test_check and not gate_on:
@@ -108,7 +111,6 @@ def main(payload):
         done_turns = st.data.get("done_checked_turns") or []
         if tk in done_turns:
             return allow("turn_already_gated")
-        st.data["done_checked_turns"] = (done_turns + [tk])[-50:]
 
     try:
         verdict = wg.evaluate_done_with_jev(task_text, final_assistant, evidence, cfg, core.jev_judge, redact_fn)
@@ -127,6 +129,7 @@ def main(payload):
                 f" Jev judged this change needs a second opinion ({jev_note(info)}): after the check passes, "
                 "call `ask_advisor({})` before declaring the task done."
             )
+        _mark_turn_gated(core, wire, tk)
         core.log_event({
             "session": session_id,
             "decision": "done_blocked",
@@ -143,10 +146,22 @@ def main(payload):
         need, info = jev_wants_advisor(core, parsed, cfg, session_id, wire, tk, "stop_gate")
         if not need:
             return allow(f"gate_{info}")
-        core.log_event({"session": session_id, "decision": "done_advisor_required", "mutations": evidence["mutations"], "jev": info})
+        _mark_turn_gated(core, wire, tk)
+        change_desc = (
+            f"modifying {evidence['mutations']} project file(s)"
+            if evidence["mutations"] > 0
+            else f"performing {ops_changes} state-changing operation(s)"
+        )
+        core.log_event({
+            "session": session_id,
+            "decision": "done_advisor_required",
+            "mutations": evidence["mutations"],
+            "ops_mutations": ops_changes,
+            "jev": info,
+        })
         sys.stderr.write(
-            f"[kimi-advisor completion gate] You report this task as done after modifying {evidence['mutations']} "
-            f"project file(s), and Jev judged the change needs a second opinion ({jev_note(info)}). "
+            f"[kimi-advisor completion gate] You report this task as done after {change_desc}, "
+            f"and Jev judged the change needs a second opinion ({jev_note(info)}). "
             "Call `ask_advisor({})` now for a final review before ending your turn."
         )
         return 2

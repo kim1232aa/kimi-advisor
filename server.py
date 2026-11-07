@@ -96,7 +96,7 @@ def tool_advisor_config(args):
         "config_path": core.CONFIG_PATH,
         "changed": sorted(changes),
         "settings": core.settings_view(cfg),
-        "current_model_efforts": efforts.get(cfg["model"], []),
+        "current_model_efforts": efforts.get(core.configured_models(cfg)[0], []),
         "model_pool": pool,
         "jev_presets": core.JEV_PRESETS,
         "stats": core.stats(),

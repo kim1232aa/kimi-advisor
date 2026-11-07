@@ -7,6 +7,7 @@ Flow of one ask_advisor call:
   -> same-model check -> Jev screen (skip low-stakes, self-answerable) -> advisor model from config.toml.
 """
 
+import concurrent.futures
 import fcntl
 import glob
 import json
@@ -263,11 +264,16 @@ def build_settings_patch(changes):
     patch = {}
     for key, value in changes.items():
         if key == "model":
-            alias = str(value).strip()
-            provider, _ = resolve_model(alias)
-            if provider.get("type") not in CALLERS:
-                raise AdvisorError(f'model: provider type "{provider.get("type")}" is not supported')
-            patch["model"] = alias
+            raw_items = value if isinstance(value, list) else str(value).split(",")
+            aliases = [str(a).strip() for a in raw_items if str(a).strip()]
+            if not aliases:
+                raise AdvisorError("model: at least one model alias is required")
+            deduped = list(dict.fromkeys(aliases))
+            for alias in deduped:
+                provider, _ = resolve_model(alias)
+                if provider.get("type") not in CALLERS:
+                    raise AdvisorError(f'model "{alias}": provider type "{provider.get("type")}" is not supported')
+            patch["model"] = ",".join(deduped)
         elif key == "effort":
             v = str(value).strip().lower()
             if v not in ("off", "default", "none") and v not in EFFORTS:
@@ -356,6 +362,26 @@ def model_identity(alias, kimi_cfg):
     except AdvisorError:
         name = alias
     return _EFFORT_SUFFIX.sub("", name.rsplit("/", 1)[-1].lower())
+
+
+def configured_models(cfg):
+    """Return deduplicated list of configured advisor model aliases (supports comma-separated string or list)."""
+    raw = (cfg or {}).get("model") or DEFAULTS["model"]
+    items = raw if isinstance(raw, list) else str(raw).split(",")
+    out = []
+    for item in items:
+        a = str(item).strip()
+        if a and a not in out:
+            out.append(a)
+    return out or [DEFAULTS["model"]]
+
+
+def all_same_model(executor, cfg, kimi_cfg):
+    """True only when disable_same_model is on and EVERY configured advisor model matches executor."""
+    if not (cfg or {}).get("disable_same_model", True) or not executor:
+        return False
+    exec_id = model_identity(executor, kimi_cfg)
+    return all(model_identity(m, kimi_cfg) == exec_id for m in configured_models(cfg))
 
 
 # ---------------------------------------------------------------- redaction
@@ -1134,8 +1160,7 @@ def _openai_responses(provider, model, system, user, effort, max_tokens, timeout
 CALLERS = {"anthropic": _anthropic, "openai": _openai_chat, "openai_responses": _openai_responses}
 
 
-def call_advisor_model(cfg, user_text, kimi_cfg=None):
-    alias = cfg["model"]
+def call_advisor_one(alias, cfg, user_text, kimi_cfg=None):
     provider, model = resolve_model(alias, kimi_cfg)
     ptype = provider.get("type")
     caller = CALLERS.get(ptype)
@@ -1144,6 +1169,11 @@ def call_advisor_model(cfg, user_text, kimi_cfg=None):
     effort = cfg.get("effort")
     if effort and effort not in EFFORTS:
         raise AdvisorError(f'invalid effort "{effort}"; use one of {EFFORTS} or null')
+    supported = model.get("support_efforts") or []
+    if effort and supported and effort not in supported:
+        req_idx = EFFORTS.index(effort)
+        lower = [e for e in supported if e in EFFORTS and EFFORTS.index(e) <= req_idx]
+        effort = lower[-1] if lower else supported[-1]
     t0 = time.time()
     text, tin, tout, truncated = "", None, None, False
     for _ in range(2):  # rpiv-advisor: one retry on an empty response, never a loop
@@ -1160,6 +1190,31 @@ def call_advisor_model(cfg, user_text, kimi_cfg=None):
             "input_tokens": tin, "output_tokens": tout, "truncated": truncated}
 
 
+def call_advisor_models(aliases, cfg, user_text, kimi_cfg=None):
+    """Call one or more advisor models in parallel, returning (results, errors) in alias order."""
+    if len(aliases) == 1:
+        try:
+            return [call_advisor_one(aliases[0], cfg, user_text, kimi_cfg)], []
+        except (AdvisorError, OSError) as e:
+            return [], [(aliases[0], str(e))]
+    results_map, errors = {}, []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(aliases)) as pool:
+        futs = {pool.submit(call_advisor_one, a, cfg, user_text, kimi_cfg): a for a in aliases}
+        for fut in concurrent.futures.as_completed(futs):
+            alias = futs[fut]
+            try:
+                results_map[alias] = fut.result()
+            except (AdvisorError, OSError, Exception) as e:  # noqa: BLE001
+                errors.append((alias, str(e)))
+    ordered = [results_map[a] for a in aliases if a in results_map]
+    ordered_errors = [(a, msg) for a in aliases for ea, msg in errors if ea == a]
+    return ordered, ordered_errors
+
+
+def call_advisor_model(cfg, user_text, kimi_cfg=None):
+    return call_advisor_one(configured_models(cfg)[0], cfg, user_text, kimi_cfg)
+
+
 def _neutralize(text):
     return re.sub(r"</(conversation|executor_tools)>", r"<\\/\1>", text)
 
@@ -1167,11 +1222,14 @@ def _neutralize(text):
 def context_budget_chars(cfg, kimi_cfg):
     if cfg.get("context_max_chars"):
         return int(cfg["context_max_chars"])
-    try:
-        _, model = resolve_model(cfg["model"], kimi_cfg)
-        ctx_tokens = int(model.get("max_context_size") or 200000)
-    except AdvisorError:
-        ctx_tokens = 200000
+    caps = []
+    for alias in configured_models(cfg):
+        try:
+            _, model = resolve_model(alias, kimi_cfg)
+            caps.append(int(model.get("max_context_size") or 200000))
+        except AdvisorError:
+            caps.append(200000)
+    ctx_tokens = min(caps) if caps else 200000
     reserve = cfg["max_output_tokens"] + ANTHROPIC_THINKING_BUDGET.get(cfg.get("effort") or "", 0) + 8000
     return max(20000, (ctx_tokens - reserve) * 2)
 
@@ -1211,6 +1269,7 @@ def consult(args, wire_path=None, call_id=None, binding="none"):
     parsed = parse_wire(wire_path, exclude_call_id=call_id) if wire_path else None
     entries = parsed["entries"] if parsed else []
     session_key = wire_path or "unbound"
+    all_models = configured_models(cfg)
     base_log = {"session": os.path.basename(os.path.dirname(os.path.dirname(os.path.dirname(wire_path))))
                 if wire_path else None, "binding": binding, "force": force,
                 "executor": parsed["executor_model"] if parsed else None, "advisor": cfg["model"]}
@@ -1223,12 +1282,21 @@ def consult(args, wire_path=None, call_id=None, binding="none"):
     if parsed is None:
         notes.append("no session context bound (advice is based on the focus only)")
     executor = parsed["executor_model"] if parsed else None
-    if (not force and cfg["disable_same_model"] and executor
-            and model_identity(executor, kimi_cfg) == model_identity(cfg["model"], kimi_cfg)):
+    if not force and cfg["disable_same_model"] and executor:
+        exec_id = model_identity(executor, kimi_cfg)
+        active_models = [m for m in all_models if model_identity(m, kimi_cfg) != exec_id]
+        skipped_same = [m for m in all_models if m not in active_models]
+    else:
+        active_models = list(all_models)
+        skipped_same = []
+
+    if not active_models:
         return skipped("skipped_same_model",
                        f"Advisor consultation skipped: the executor ({executor}) and the advisor ({cfg['model']}) are "
                        "the same model, so a review adds little. Proceed on your own judgment. The user can pick a "
                        "different advisor with /kimi-advisor:config, or set disable_same_model=false.")
+    if skipped_same:
+        notes.append(f"same-model skipped: {', '.join(skipped_same)}")
 
     with SessionState(session_key) as st:
         st.data.pop("pending_steer", None)
@@ -1267,22 +1335,48 @@ def consult(args, wire_path=None, call_id=None, binding="none"):
                              f"self-answerable={detail['self_answerable']:.2f}, {detail['latency_ms']}ms)")
 
         message = advisor_message(parsed, cfg, kimi_cfg, question)
-        try:
-            result = call_advisor_model(cfg, message, kimi_cfg)
-        except (AdvisorError, OSError) as e:
-            log_event({**base_log, "decision": "error", "error": str(e)[:500]})
-            return f"Advisor call failed: {e}", True
+        t_start = time.time()
+        results, errors = call_advisor_models(active_models, cfg, message, kimi_cfg)
+        if not results:
+            err_msg = "; ".join(f"{a}: {e}" for a, e in errors)
+            log_event({**base_log, "decision": "error", "error": err_msg[:500]})
+            return f"Advisor call failed: {err_msg}", True
         st.data["calls"] += 1
         st.data.pop("last_skip_turn", None)
 
-    log_event({**base_log, "decision": "consulted", "latency_s": result["latency_s"], "sent_chars": len(message),
-               "input_tokens": result["input_tokens"], "output_tokens": result["output_tokens"],
-               "truncated": result["truncated"]})
-    tokens = (f"in {result['input_tokens']} / out {result['output_tokens']} tokens"
-              if result["input_tokens"] is not None else "tokens n/a")
-    header = " · ".join([f"Advisor {result['alias']}", f"{result['latency_s']}s", tokens] + notes)
-    text = result["text"]
-    if result["truncated"]:
+    wall_s = round(time.time() - t_start, 1)
+    in_tok = sum(r["input_tokens"] or 0 for r in results) if any(r["input_tokens"] is not None for r in results) else None
+    out_tok = sum(r["output_tokens"] or 0 for r in results) if any(r["output_tokens"] is not None for r in results) else None
+    any_trunc = any(r["truncated"] for r in results)
+    log_payload = {
+        **base_log,
+        "decision": "consulted",
+        "models": [r["alias"] for r in results],
+        "latency_s": wall_s,
+        "sent_chars": len(message),
+        "input_tokens": in_tok,
+        "output_tokens": out_tok,
+        "truncated": any_trunc,
+    }
+    if errors:
+        log_payload["partial_errors"] = [{a: e[:300]} for a, e in errors]
+    log_event(log_payload)
+
+    if len(results) == 1 and not errors:
+        r = results[0]
+        tokens = (f"in {r['input_tokens']} / out {r['output_tokens']} tokens"
+                  if r["input_tokens"] is not None else "tokens n/a")
+        header = " · ".join([f"Advisor {r['alias']}", f"{r['latency_s']}s", tokens] + notes)
+        text = r["text"]
+    else:
+        parts_hdr = [f"{r['alias']} ({r['latency_s']}s, in {r['input_tokens'] or '?'} / out {r['output_tokens'] or '?'})" for r in results]
+        header = " · ".join([f"Advisors({len(results)}): " + " + ".join(parts_hdr), f"wall {wall_s}s"] + notes)
+        sections = [f"### [Advisor {i}: {r['alias']} · {r['latency_s']}s]\n{r['text']}" for i, r in enumerate(results, 1)]
+        if errors:
+            sections.append("[Advisor partial error — " + "; ".join(f"{a}: {e}" for a, e in errors) + "]")
+        text = "\n\n".join(sections)
+
+    if any_trunc:
         text += (f"\n\n[Advisor reply was cut off at max_output_tokens={cfg['max_output_tokens']}; "
                  "the user can raise it with /kimi-advisor:config.]")
     return f"{header}\n\n{text}", False

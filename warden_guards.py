@@ -372,10 +372,39 @@ def classify_tool_result(tool_name, input_args, is_error, output, cwd=None):
     return "read" if is_read_only_command(raw_cmd) else "unknown"
 
 
+OPS_MUTATION_CMD_RE = re.compile(
+    r"(?:^|[;&|]\s*|\s&&\s*|\n\s*)(?:sudo\s+)?"
+    r"(?:"
+    r"docker\s+(?:build|tag|push|rm|rmi|stop|start|restart|kill|commit|update|compose\s+(?:[^\n;&|]*\s+)?(?:up|down|restart|start|stop|rm|build|pull|push))\b"
+    r"|docker-compose\s+(?:[^\n;&|]*\s+)?(?:up|down|restart|start|stop|rm|build|pull|push)\b"
+    r"|(?:systemctl|service|supervisorctl|pm2|1pctl)\s+(?:start|stop|restart|reload|enable|disable|delete)\b"
+    r"|git\s+(?:commit|push|merge|rebase|cherry-pick|reset|revert|tag|am|apply)\b"
+    r"|sed\s+-[a-zA-Z]*i\b"
+    r")",
+    re.I,
+)
+
+
+def is_ops_mutation(tool_name, input_args, is_error, output):
+    """True when a tool call mutates task/container/service/git state outside Edit/Write."""
+    if result_failed(is_error, output):
+        return False
+    tool = (tool_name or "").lower()
+    args = input_args if isinstance(input_args, dict) else {}
+    if tool == "todolist":
+        return bool(args.get("todos"))
+    if tool != "bash":
+        return False
+    raw_cmd = args.get("command") if isinstance(args.get("command"), str) else ""
+    if not raw_cmd or is_read_only_command(raw_cmd):
+        return False
+    return bool(OPS_MUTATION_CMD_RE.search(_strip_heredocs_and_echo_data(raw_cmd)))
+
+
 def collect_turn_evidence(turn_entries, cwd=None, redact_fn=None):
     """Build pi-warden done.js Evidence across the turn's tool_call/tool_result pairs."""
     redact_fn = redact_fn or (lambda s: s)
-    evidence = {"mutations": 0, "checks": [], "checks_before_mutation": 0}
+    evidence = {"mutations": 0, "ops_mutations": 0, "checks": [], "checks_before_mutation": 0}
     pending = {}
     for e in turn_entries:
         if e["kind"] == "tool_call":
@@ -396,6 +425,8 @@ def collect_turn_evidence(turn_entries, cwd=None, redact_fn=None):
                 cmd = args.get("command") if isinstance(args, dict) else ""
                 label = redact_fn(cmd[:200] + ("…" if len(cmd) > 200 else "")) if cmd else "check"
                 evidence["checks"].append({"call": label, "passed": outcome == "check-pass"})
+            if is_ops_mutation(call["name"], args, e.get("error"), e.get("text") or ""):
+                evidence["ops_mutations"] += 1
     return evidence
 
 
