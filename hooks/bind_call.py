@@ -51,6 +51,8 @@ def trace(payload, outcome):
 
 
 def _gate_todolist_all_done(payload):
+    if payload.get("agent_id") not in (None, "", "main"):
+        return 0
     import advisor_core as core
     import warden_guards as wg
 
@@ -63,6 +65,8 @@ def _gate_todolist_all_done(payload):
     if not wire:
         return 0
     parsed = getattr(core, "parse_wire_current_turn", core.parse_wire)(wire)
+    if (parsed or {}).get("in_flight_subagent"):
+        return 0
     turn_entries, tk, _, _ = core.current_turn_slice(parsed["entries"])
     if not tk:
         return 0
